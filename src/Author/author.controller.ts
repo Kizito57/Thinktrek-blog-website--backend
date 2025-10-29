@@ -1,4 +1,4 @@
-// backend/src/modules/author/author.controller.ts
+
 import bcrypt from 'bcryptjs';
 import { Request, Response } from 'express';
 import * as authorService from './author.service';

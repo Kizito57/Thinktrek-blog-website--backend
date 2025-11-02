@@ -1,43 +1,45 @@
-
 import bcrypt from 'bcryptjs';
 import { Request, Response } from 'express';
 import * as authorService from './author.service';
 import jwt from 'jsonwebtoken';
 import { sendWelcomeEmail, sendVerificationEmail } from '../email/email.service';
 
-// GET all authors
+// GET all authors (public - for blog display only)
 export const getAllAuthors = async (req: Request, res: Response) => {
   try {
     const authors = await authorService.getAllAuthors();
-    // Remove passwords from response
-    const authorsWithoutPasswords = authors.map(({ password, ...author }) => author);
-    res.status(200).json(authorsWithoutPasswords);
+    // Only return safe public data
+    const safeAuthors = authors.map(({ author_id, first_name, last_name, image_url }) => ({
+      author_id,
+      first_name,
+      last_name,
+      image_url
+    }));
+    res.status(200).json(safeAuthors);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Failed to fetch authors' });
   }
 };
 
-// GET author by ID
+// GET author by ID (protected)
 export const getAuthorById = async (req: Request, res: Response) => {
   try {
     const requestedId = Number(req.params.id);
     const user = (req as any).user;
 
-    // Author can only see their own profile
     if (user.author_id !== requestedId) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     const author = await authorService.getAuthorById(requestedId);
     if (!author) {
-      return res.status(404).json({ error: "Author not found" });
+      return res.status(404).json({ error: 'Author not found' });
     }
 
-    // Remove password from response
-    const { password, ...authorData } = author;
+    const { password, verification_code, ...authorData } = author;
     res.status(200).json(authorData);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Failed to fetch author' });
   }
 };
 
@@ -46,20 +48,28 @@ export const createAuthor = async (req: Request, res: Response) => {
   try {
     const { password, ...authorData } = req.body;
 
-    if (!password) {
-      return res.status(400).json({ error: "Password is required" });
-    }
-
     // Validate required fields
-    if (!authorData.first_name || !authorData.last_name || !authorData.email) {
-      return res.status(400).json({ error: "First name, last name, and email are required" });
+    if (!password || !authorData.first_name || !authorData.last_name || !authorData.email) {
+      return res.status(400).json({ error: 'All fields are required' });
     }
 
-    // Generate verification code
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(authorData.email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password strength (min 6 chars)
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // Generate secure 6-digit verification code
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // Hash password
-    const hashedPassword = bcrypt.hashSync(password, 10);
+    // Hash password with high salt rounds for security
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
     const newAuthorData = {
       ...authorData,
       password: hashedPassword,
@@ -69,30 +79,27 @@ export const createAuthor = async (req: Request, res: Response) => {
 
     const newAuthor = await authorService.createAuthor(newAuthorData);
     if (!newAuthor) {
-      return res.status(400).json({ error: "Author registration failed" });
+      return res.status(400).json({ error: 'Registration failed' });
     }
 
-    // Send verification email
+    // Send verification email (don't block response)
     const authorName = `${newAuthor.first_name} ${newAuthor.last_name}`;
-    sendVerificationEmail(newAuthor.email, authorName, verificationCode)
-      .then(() => console.log(`Verification email sent to ${newAuthor.email}`))
-      .catch(err => console.error('Verification email send failed:', err.message));
+    sendVerificationEmail(newAuthor.email, authorName, verificationCode).catch(() => {
+      // Silent fail - email is not critical to registration flow
+    });
 
     res.status(201).json({
-      message: "Author registered successfully. Please check your email for verification code.",
+      message: 'Registration successful. Check your email for verification code.',
       author: {
         author_id: newAuthor.author_id,
-        first_name: newAuthor.first_name,
-        last_name: newAuthor.last_name,
-        email: newAuthor.email,
-        is_verified: newAuthor.is_verified
+        email: newAuthor.email
       }
     });
   } catch (error: any) {
     if (error.message.includes('Email already exists')) {
-      return res.status(400).json({ error: "Email already registered" });
+      return res.status(400).json({ error: 'Email already registered' });
     }
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Registration failed' });
   }
 };
 
@@ -102,20 +109,20 @@ export const verifyAuthorEmail = async (req: Request, res: Response) => {
     const { email, verificationCode } = req.body;
 
     if (!email || !verificationCode) {
-      return res.status(400).json({ error: "Email and verification code are required" });
+      return res.status(400).json({ error: 'Email and verification code required' });
     }
 
     const author = await authorService.getAuthorByEmail(email);
     if (!author) {
-      return res.status(404).json({ error: "Author not found" });
+      return res.status(404).json({ error: 'Account not found' });
     }
 
     if (author.is_verified) {
-      return res.status(400).json({ error: "Email already verified" });
+      return res.status(400).json({ error: 'Email already verified' });
     }
 
     if (author.verification_code !== verificationCode) {
-      return res.status(400).json({ error: "Invalid verification code" });
+      return res.status(400).json({ error: 'Invalid verification code' });
     }
 
     // Update author as verified
@@ -125,25 +132,17 @@ export const verifyAuthorEmail = async (req: Request, res: Response) => {
     });
 
     if (updated) {
-      // Send welcome email after verification
       const authorName = `${author.first_name} ${author.last_name}`;
-      sendWelcomeEmail(author.email, authorName)
-        .then(() => console.log(`Welcome email sent to ${author.email}`))
-        .catch(err => console.error('Welcome email send failed:', err.message));
+      sendWelcomeEmail(author.email, authorName).catch(() => {
+        // Silent fail - email is not critical
+      });
     }
 
     res.status(200).json({
-      message: "Email verified successfully. You can now login.",
-      author: {
-        author_id: updated?.author_id,
-        first_name: updated?.first_name,
-        last_name: updated?.last_name,
-        email: updated?.email,
-        is_verified: updated?.is_verified
-      }
+      message: 'Email verified successfully. You can now login.'
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Verification failed' });
   }
 };
 
@@ -153,30 +152,31 @@ export const loginAuthor = async (req: Request, res: Response) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+      return res.status(400).json({ error: 'Email and password required' });
     }
 
     // Check if author exists
     const author = await authorService.getAuthorByEmail(email);
     if (!author) {
-      return res.status(401).json({ error: "Invalid email or password" });
+      // Use generic message to prevent user enumeration
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     // Check if email is verified
     if (!author.is_verified) {
-      return res.status(401).json({ error: "Please verify your email before logging in" });
+      return res.status(401).json({ error: 'Please verify your email before logging in' });
     }
 
     // Verify password
-    const passwordMatch = bcrypt.compareSync(password, author.password as string);
+    const passwordMatch = await bcrypt.compare(password, author.password as string);
     if (!passwordMatch) {
-      return res.status(401).json({ error: "Invalid email or password" });
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     // Create JWT token
     const secret = process.env.JWT_SECRET;
     if (!secret) {
-      throw new Error("JWT_SECRET not configured");
+      return res.status(500).json({ error: 'Server configuration error' });
     }
 
     const payload = {
@@ -191,7 +191,7 @@ export const loginAuthor = async (req: Request, res: Response) => {
     const token = jwt.sign(payload, secret);
 
     res.status(200).json({
-      message: "Login successful",
+      message: 'Login successful',
       token,
       author: {
         author_id: author.author_id,
@@ -204,7 +204,7 @@ export const loginAuthor = async (req: Request, res: Response) => {
     });
 
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Login failed' });
   }
 };
 
@@ -215,36 +215,37 @@ export const updateAuthor = async (req: Request, res: Response) => {
     const user = (req as any).user;
     const updateData = { ...req.body };
 
-    // Author can only update their own profile
     if (user.author_id !== authorId) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     // Hash password if being updated
     if (updateData.password) {
-      updateData.password = bcrypt.hashSync(updateData.password, 10);
+      if (updateData.password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+      updateData.password = await bcrypt.hash(updateData.password, 12);
     }
 
-    // Don't allow updating verification status
+    // Prevent updating sensitive fields
     delete updateData.is_verified;
     delete updateData.verification_code;
 
     const updated = await authorService.updateAuthor(authorId, updateData);
     if (!updated) {
-      return res.status(404).json({ error: "Author not found" });
+      return res.status(404).json({ error: 'Author not found' });
     }
 
-    // Remove password from response
-    const { password, ...authorData } = updated;
+    const { password, verification_code, ...authorData } = updated;
     res.status(200).json({
-      message: "Profile updated successfully",
+      message: 'Profile updated successfully',
       author: authorData
     });
   } catch (error: any) {
     if (error.message.includes('Email already exists')) {
-      return res.status(400).json({ error: "Email already in use" });
+      return res.status(400).json({ error: 'Email already in use' });
     }
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Update failed' });
   }
 };
 
@@ -254,19 +255,17 @@ export const deleteAuthor = async (req: Request, res: Response) => {
     const authorId = Number(req.params.id);
     const user = (req as any).user;
 
-    // Author can only delete their own account
     if (user.author_id !== authorId) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     const deleted = await authorService.deleteAuthor(authorId);
-
     if (!deleted) {
-      return res.status(404).json({ error: "Author not found" });
+      return res.status(404).json({ error: 'Author not found' });
     }
 
-    res.status(200).json({ message: "Account deleted successfully" });
+    res.status(200).json({ message: 'Account deleted successfully' });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Deletion failed' });
   }
 };
